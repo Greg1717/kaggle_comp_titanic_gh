@@ -1,0 +1,466 @@
+---
+title: "Logistic Regression - Titanic"
+output: 
+        html_document:
+                toc: true
+                toc_depth: 2
+                toc_float: true
+                number_sections: true
+date: "`r Sys.Date()`"
+editor_options: 
+  chunk_output_type: inline
+---
+
+
+# Settings & Packages
+```{r settings}
+knitr::opts_chunk$set(echo = TRUE)
+library(data.table)
+library(caret)
+library(ggplot2)
+library(lattice)
+library(doParallel)
+library(kernlab)
+```
+
+```{r import csv, include=FALSE}
+ds_train <- read.csv(file = "data/train.csv")
+ds_test <- read.csv(file = "data/test.csv")
+subm_template <- read.csv(file = "data/gender_submission.csv")
+head(ds_train)
+head(ds_test)
+head(subm_template)
+
+# create full dataset
+ds_test$Survived <- NA
+ds_train$train <- T
+ds_test$train <- F
+ds_full <- rbind(ds_train, ds_test)
+remove(ds_train)
+remove(ds_test)
+ds_full <- as.data.table(ds_full)
+
+# Embarked; fill in where empty or is.na()
+ds_full[, table(Embarked, useNA = "always")]
+ds_full[Embarked == "", Embarked := "S"]
+ds_full[, table(Embarked, useNA = "always")]
+
+# create family size
+ds_full[, family_heads := SibSp + Parch + 1]
+```
+
+
+# Analyze names to determine if adult or child 
+```{r}
+# Grab title from passenger names
+ds_full$Title <- gsub('(.*, )|(\\..*)', '', ds_full$Name)
+
+# Show title counts by sex
+table(ds_full$Sex, ds_full$Title)
+
+# Identify adult vs child based on name
+ds_full[, ad_ch := fcase(Name %like% "(Mr\\.|Mrs\\.|Dr\\.|Col\\.|Rev\\.|Mme\\.|Ms\\.|Capt\\.|Don\\.|Dona\\.|Lady|Major|Sir)", "adult",
+                         Name %like% "(Master|Miss\\.|Mlle\\.)" & Parch > 0, "child",
+                         family_heads == 1, "adult",
+                         Parch == 0, "adult",
+                         Parch == 1 & SibSp == 1, "adult",
+                         default = NA)]
+ds_full[is.na(ad_ch)]
+# remove Title again as it only served the purpose of identifying adults and children; also it causes problems in ML as some titles appear very rarely
+ds_full[, Title := NULL]
+```
+
+
+
+# Do families sink or swim together?
+
+Now that we've taken care of splitting passenger name into some new variables, we can take it a step further and make some new family variables. First we're going to make a **family size** variable based on number of siblings/spouse(s) (maybe someone has more than one spouse?) and number of children/parents. 
+
+What does our family size variable look like? To help us understand how it may relate to survival, let's plot it among the training data.
+
+```{r, message=FALSE, warning=FALSE}
+# Use ggplot2 to visualize the relationship between family size & survival
+ggplot(ds_full[1:891,], aes(x = family_heads, fill = factor(Survived))) +
+  geom_bar(stat = 'count', position = 'dodge') +
+  scale_x_continuous(breaks = c(1:11)) +
+  labs(x = 'Family Size')
+  # theme_few()
+```
+
+Ah hah. We can see that there's a survival penalty to singletons and those with family_heads sizes above 4. We can collapse this variable into three levels which will be helpful since there are comparatively fewer large families. Let's create a **discretized family size** variable.
+
+```{r}
+# Discretize family size
+ds_full[, family_size_discrete := fcase(family_heads == 1, "single",
+                                        family_heads > 4, "large",
+                                        default = "average")]
+
+# Show family size by survival using a mosaic plot
+mosaicplot(
+        table(ds_full$family_size_discrete,
+              ds_full$Survived,
+              useNA = "no"),
+        main = 'Family Size by Survival',
+        shade = TRUE
+)
+
+# considering variable importance: an average (not large) family seems to survive more often than singles or large families
+ds_full[, average_family := fcase(family_size_discrete == "average", TRUE,
+                                  default = FALSE)]
+
+ds_full[, family_size_discrete := NULL]
+```
+
+The mosaic plot shows that we preserve our rule that there's a survival penalty among singletons and large families, but a benefit for passengers in small families. 
+
+
+# Other Variables
+
+```{r}
+# Fare; insert where missing
+ds_full[is.na(Fare)]
+median_Fare_3Pclass <- ds_full[Pclass == 3, median(Fare, na.rm = T)]
+ds_full[is.na(Fare), Fare := median_Fare_3Pclass]
+remove(median_Fare_3Pclass)
+
+# remove irrelevant
+ds_full[, Ticket := NULL]
+ds_full[, Cabin := NULL]
+ds_full[, Name := NULL]
+
+# impute Age
+median_age_adult <- ds_full[ad_ch == "adult", median(Age, na.rm = T)]
+median_age_child <- ds_full[ad_ch == "child", median(Age, na.rm = T)]
+ds_full[is.na(Age)]
+ds_full[is.na(Age), Age := fcase(ad_ch == "adult", median_age_adult,
+                                 ad_ch == "child", median_age_child)]
+remove(median_age_adult)
+remove(median_age_child)
+
+# convert to factors
+ds_full$Pclass <- as.factor(ds_full$Pclass)
+ds_full$Sex <- as.factor(ds_full$Sex)
+ds_full$Embarked <- as.factor(ds_full$Embarked)
+ds_full$ad_ch <- as.factor(ds_full$ad_ch)
+
+# check if variable Embarked seems relevant by means of logistic regression
+model_glm <- glm(Survived ~ Sex + Age + Pclass + Embarked,
+                 data = ds_full,
+                 family = binomial)
+
+summary(model_glm)
+# Embarked seems in fact irrelevant, I remove it from the dataset
+ds_full[, Embarked := NULL]
+
+# split into training and test set again
+ds_train <- ds_full[train == TRUE]
+ds_train[, train := NULL]
+ds_test <- ds_full[train == FALSE]
+ds_test[, train := NULL]
+remove(ds_full)
+# convert variable Survived to factor
+ds_train$Survived <- as.factor(ds_train$Survived)
+
+# remove PassengerId 
+ds_train[, PassengerId := NULL]
+ds_train
+```
+
+
+# Imported Data Sets
+
+```{r}
+str(ds_train)
+```
+
+Submission template:
+```{r}
+str(subm_template)
+```
+
+
+```{r}
+summary(ds_train)
+```
+
+
+# Clean Data
+
+## Near Zero Variance Predictors
+
+The identified near zero variance predictors are the following:
+
+```{r}
+# create a zero variance variable for demonstration purposes
+ds_train$one <- 1
+near_zero_vars <- nearZeroVar(ds_train)
+ds_train[, ..near_zero_vars]
+```
+
+
+```{r}
+if (length(near_zero_vars) > 0) {
+        ds_train <- ds_train[, -c(..near_zero_vars)]
+}
+remove(near_zero_vars)
+head(ds_train)
+```
+
+
+## Reduce Collinearity
+
+**Collinearity** is the situation where a pair of predictor variables have a substantial correlation with each other. In general, there are good reasons to avoid data with highly correlated predictors as it can result in **highly unstable models** and **degraded predictive performance**.
+
+
+## Box Plot
+
+### Base R
+
+```{r}
+boxplot(Fare ~ Survived,
+        data = ds_train,
+  ylab = "Fare",
+  main = "Fare ~ Survived"
+)
+```
+
+
+### ggplot
+
+```{r}
+ggplot(ds_train) +
+  aes(x = Survived, y = Fare) +
+  geom_boxplot(fill = "#0c4c8a") +
+  theme_minimal()
+```
+
+
+### lattice
+
+```{r}
+bwplot(Survived ~ Fare | Sex, ds_train)
+```
+
+## Scatter Plot
+
+```{r}
+# pairs(ds_train,
+#       main = "Titanic - pairs(ds_train)",
+#       pch = 21,
+#       cex = 2,
+#       bg = c("red", "green3")[unclass(ds_train$Survived)])
+```
+
+
+```{r}
+lattice::splom(ds_train,
+               groups = ds_train$Survived)
+```
+
+#### ggpairs()
+
+```{r}
+library(GGally)
+ggpairs(data = ds_train, 
+        progress = FALSE, 
+        ggplot2::aes(colour=Survived))
+```
+
+
+***
+# Machine Learning 
+
+Alternatives to try:
+
+- Support Vector Machine
+- Boosted Trees
+- Random Forest
+
+
+## Logistic Regression Base R
+
+Start with all variables and exclude irrelevant ones.
+
+```{r}
+set.seed(997)
+# Singularity means that your predictor variables are linearly dependent, i.e. one of the variables can be expressed as linear combination of other variables.
+model_glm <- glm(Survived ~ ., 
+                 data = ds_train[, -c("SibSp", "Parch", "Fare")], 
+                 family = binomial)
+summary(model_glm)
+```
+
+
+Confusion Matrix:
+
+```{r}
+prediction_glm_base <-
+        predict(object = model_glm,
+                newdata = ds_train,
+                type = "response")
+
+# review prediction
+head(prediction_glm_base)
+
+# create confusion matrix
+conf_matrix_glm_base <-
+        confusionMatrix(as.factor(ifelse(prediction_glm_base < 0.5, 0, 1)),
+                        ds_train$Survived)
+
+# extract Accuracy into variable
+accuracy_glm_base <- conf_matrix_glm_base$overall["Accuracy"]
+
+# review confusion matrix output
+conf_matrix_glm_base
+```
+
+
+## Logistic Regression (Caret) 
+
+```{r}
+model_glm_caret_preproc <- caret::train(
+        Survived ~ .,
+        data = ds_train[, -c("SibSp", "Parch", "Fare")],
+        # preProc = c("BoxCox", "center", "scale"),
+        method = "glm"
+)
+model_glm_caret_preproc
+```
+
+```{r}
+prediction_glm_caret <-
+        predict(object = model_glm_caret_preproc,
+                newdata = ds_train,
+                type = "prob")
+
+conf_matrix_glm_caret_preproc <-
+        confusionMatrix(
+                as.factor(
+                        ifelse(prediction_glm_caret[, 2] < 0.5, 0, 1)
+                        ),
+                        ds_train$Survived)
+
+accuracy_glm_caret <- conf_matrix_glm_caret_preproc$overall["Accuracy"]
+conf_matrix_glm_caret_preproc
+```
+
+
+
+## Random Forest
+
+```{r}
+# cl <- makePSOCKcluster(5)
+# registerDoParallel(cl)
+# train model
+model_rf <- caret::train(Survived ~ .,
+                          data = ds_train[, -c("SibSp", "Parch", "Fare")],
+                          # preProc = c("BoxCox", "center", "scale"),
+                          method = "rf")
+# stopCluster(cl)
+model_rf
+```
+
+```{r}
+plot(model_rf)
+```
+
+Calculation of variable importance:
+```{r}
+caret::varImp(model_rf)
+```
+
+```{r}
+prediction_rf <-
+        predict(object = model_rf,
+                newdata = ds_train,
+                type = "prob")
+
+conf_matrix_rf <-
+        confusionMatrix(as.factor(ifelse(prediction_rf[, 2] < 0.5, 0, 1)),
+                        ds_train$Survived)
+accuracy_rf <- conf_matrix_rf$overall["Accuracy"]
+conf_matrix_rf
+```
+
+
+## Support Vector Machine
+
+```{r}
+cl <- makePSOCKcluster(5)
+registerDoParallel(cl)
+
+#Setup parameters for optimisation
+params <-
+        expand.grid(sigma = seq(0.05, 2, 0.05), C = seq(0.5, 2, 0.5))
+head(params)
+tail(params)
+#Train model with entire train data set
+model_svmr <- train(Survived ~ .,
+                    method = "svmRadial",
+                    data = ds_train,
+                    # preProcess = c("scale", "center"),
+                    # trControl = control,
+                    tuneGrid = params)
+stopCluster(cl)
+model_svmr$bestTune
+# model_svmr$method
+head(model_svmr$results)
+```
+
+
+Confusion matrix:
+
+```{r}
+prediction_svmr <-
+        predict(object = model_svmr,
+                newdata = ds_train)
+
+conf_matrix_svmr <-
+        confusionMatrix(prediction_svmr,
+                        ds_train$Survived)
+accuracy_svmr <- conf_matrix_svmr$overall["Accuracy"]
+conf_matrix_rf
+```
+
+
+
+# Prediction (ensemble)
+
+```{r}
+#Predict Survival of Passengers in the test data
+prediction_test_rf <- predict(model_rf, ds_test)
+prediction_test_glm <- predict(model_glm_caret_preproc, ds_test)
+prediction_test_svm <- predict(model_svmr, ds_test)
+pred_summarized <- data.frame(rf = prediction_test_rf, glm = prediction_test_glm, svm = prediction_test_svm)
+pred_summarized$Survived <- 
+        round(
+                (as.numeric(as.character(pred_summarized$rf)) + 
+                         as.numeric(as.character(pred_summarized$glm)) + 
+                         as.numeric(as.character(pred_summarized$svm))
+                 ) / 3, 0)
+
+# in this case the RF result is so good that I will submit only RF
+# pred_summarized$Survived <- 
+#         pred_summarized$rf
+
+pred_summarized <- as.data.table(pred_summarized)
+submission <- data.frame(PassengerID = ds_test$PassengerId,  Survived = pred_summarized$Survived)
+```
+
+Review lines where prediction is not equal:
+```{r}
+pred_summarized[rf != glm | rf != svm | glm != svm]
+```
+
+
+Create submission file:
+
+```{r}
+write.table(
+        submission,
+        file = "submission.csv",
+        row.names = F,
+        sep = ",",
+        quote = FALSE
+)
+```
